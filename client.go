@@ -2,121 +2,119 @@ package main
 
 import (
 	"bufio"
-	"errors"
+	"bytes"
 	"fmt"
-	"io"
+	"log"
 	"net"
-	"strings"
 	"time"
 )
 
-// Client represents a chat client
+const messageBufferSize = 256
+
+// Client represents a single chatting user
 type Client struct {
 	// The name of the client
 	username string
 
-	// A TCP connection
+	// conn is the TCP connection for this client.
 	conn net.Conn
 
-	// Visual color on terminal
-	color string
+	// send is a channel on which messages are sent.
+	send chan []byte
+
+	// room is the room this client is chatting in.
+	room *Room
 
 	// Prompt format for the client
 	prompt string
 }
 
-// NewClient initializes a new Client instance.
-func NewClient(conn net.Conn) *Client {
+func NewClient(conn net.Conn, username string, room *Room) *Client {
 	return &Client{
-		conn:  conn,
-		color: getRandomColor(),
+		conn:     conn,
+		send:     make(chan []byte, messageBufferSize),
+		room:     room,
+		username: username,
+		prompt:   fmt.Sprintf("%s%s 🏠 %s%s > ", room.color, username, room.name, ColorReset),
 	}
 }
-func (c *Client) sendWelcomeMessage() error {
-	logo := `
-	▒█▀▀█ ▒█▀▀▀█ ▒█▀▀▀█ ▒█▀▄▀█ 　 ▒█▀▀█ ░█▀▀█ ▒█▀▀▀█ ▀▀█▀▀ 
-	▒█▄▄▀ ▒█░░▒█ ▒█░░▒█ ▒█▒█▒█ 　 ▒█░░░ ▒█▄▄█ ░▀▀▀▄▄ ░▒█░░ 
-	▒█░▒█ ▒█▄▄▄█ ▒█▄▄▄█ ▒█░░▒█ 　 ▒█▄▄█ ▒█░▒█ ▒█▄▄▄█ ░▒█░░ 
- `
-	_, err := c.conn.Write([]byte(logo))
-	if err != nil {
-		return err
-	}
 
-	welcomeLines := []string{
-		"🚀 Get ready for an awesome chat experience! 🚀\n",
-		"		💡 Broadcasting Live: Join the fun! 🎤 💡\n",
-		"				👉 To get started, please enter your username. 👈\n",
-	}
-
-	for _, line := range welcomeLines {
-		_, err = c.conn.Write([]byte(line))
-		if err != nil {
-			return err
-		}
-		time.Sleep(time.Second) // Adds a cool typing effect
-	}
-
-	return err
-}
-
-// sendMessage sends a message to the client.
-func (c *Client) sendMessage(msg Message) error {
-	_, err := c.conn.Write([]byte(msg.Format()))
-	return err
-}
-
-// sendPrompt sends to the client their prompt message
-func (c *Client) sendPrompt() error {
-	_, err := c.conn.Write([]byte(c.prompt))
-	return err
-}
-
-func (c *Client) requestUsername() error {
+// read allows our client to read from the TCP conn,
+// continually sending any received messages to the
+// forward channel on the room type.
+// If it encounters an error, the loop will break and the conn will be closed.
+func (c *Client) read() {
 	reader := bufio.NewReader(c.conn)
-
 	for {
-		username, err := reader.ReadString('\n')
+		if _, err := c.conn.Write([]byte(c.prompt)); err != nil {
+			log.Printf("🚨Error writing prompt: %v", err)
+			break
+		}
+
+		msg, err := reader.ReadBytes('\n')
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return fmt.Errorf("Client disconnected before entering username")
-			}
-			return err
+			log.Printf("🚨Read error: %v", err)
+			break
 		}
 
-		username = strings.TrimSpace(username)
-		if len(username) >= 5 && len(username) <= 8 {
-			c.username = username
-			return nil
+		msg = bytes.TrimSpace(msg)
+		if len(msg) == 0 {
+			continue
 		}
 
-		if _, err := c.conn.Write([]byte(fmt.Sprintf("%s 🚫 Invalid username! Please choose a name between 5 to 8 characters. Try again: %s\n", ColorRed, ColorReset))); err != nil {
-			return err
+		message := Message{
+			Content:   string(msg),
+			Sender:    c.username,
+			Timestamp: time.Now(),
 		}
+
+		c.room.forward <- message.ToJSON()
 	}
+
+	c.close()
 }
 
-// close safely closes the client's connection.
-func (c *Client) close() error {
-	return c.conn.Close()
+// write continually accepts messages from the send channel,
+// it write everything out of the conn.
+// If writing to the conn fails, the for loop is broken and the conn is closed.
+func (c *Client) write() {
+	for rawMessage := range c.send {
+		msg, err := FromJSON(rawMessage)
+		if err != nil {
+			log.Printf("❌ Failed to parse message: %v", err)
+			continue
+		}
+		if msg.Sender == c.username {
+			continue
+		}
+
+		if err := c.writeMessage(msg.formatAndConvertToBytes()); err != nil {
+			log.Printf("🚨Write error: %v", err)
+			break
+		}
+
+		if _, err := c.conn.Write([]byte(c.prompt)); err != nil {
+			log.Printf("🚨Error writing prompt: %v", err)
+		}
+	}
+	c.close()
 }
 
-// setup handles the client's initial setup process
-func (c *Client) setup() error {
-	if err := c.sendWelcomeMessage(); err != nil {
-		return fmt.Errorf("error sending welcome message: %w", err)
+// writeMessage writes the message to the TCP connection of the client
+func (c *Client) writeMessage(msg []byte) error {
+	_, err := c.conn.Write(msg)
+	return err
+}
+
+func (c *Client) close() {
+	// Ensure cleanup only happens once
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
 	}
 
-	if err := c.requestUsername(); err != nil {
-		return fmt.Errorf("Error setting username: %w", err)
+	// Notify the room that this client is leaving
+	if c.room != nil {
+		c.room.leave <- c
 	}
-
-	c.prompt = fmt.Sprintf("[%s%s%s] > ", c.color, c.username, ColorReset)
-
-	// Ensure prompt is displayed for `netcat` users
-	if err := c.sendPrompt(); err != nil {
-		return fmt.Errorf("Error sending prompt: %w", err)
-	}
-
-	return nil
 }

@@ -1,17 +1,13 @@
 package main
 
 import (
-	"context"
-	"errors"
+	"bufio"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"os"
-	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
+	"time"
 )
 
 type Server struct {
@@ -22,178 +18,166 @@ type Server struct {
 	port int
 
 	// clients stores all active client connections in a map for efficient management.
-	clients map[*Client]struct{}
+	rooms map[string]*Room
 
-	// mu is a mutex used to synchronize access to shared resources like clients map.
+	// mu is a mutex used to synchronize access to shared resources like rooms map.
 	mu sync.RWMutex
-
-	// stopChan receives signals indicating when the server should shut down gracefully.
-	stopChan chan os.Signal
-
-	// ctx provides a context that can be cancelled when shutting down the server,
-	// allowing graceful termination of ongoing operations.
-	ctx context.Context
-
-	// cancel function cancels the context when needed (e.g., during shutdown).
-	cancel context.CancelFunc
 }
 
 func NewServer(port int) *Server {
-	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		port:     port,
-		clients:  make(map[*Client]struct{}),
-		mu:       sync.RWMutex{},
-		stopChan: make(chan os.Signal, 1),
-		ctx:      ctx,
-		cancel:   cancel,
+		rooms: make(map[string]*Room),
+		port:  port,
 	}
 }
 
-func (srv *Server) run() {
-	var err error
-
-	srv.listener, err = net.Listen("tcp", fmt.Sprintf(":%d", srv.port))
+// Start begins listening for client connections.
+func (srv *Server) Start() error {
+	addr := fmt.Sprintf(":%d", srv.port)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("Failed to start server on port %d: %v", srv.port, err)
+		return fmt.Errorf("failed to start server: %w", err)
 	}
-	defer srv.listener.Close()
+	srv.listener = ln
+	log.Println("✅ Server started on", addr)
 
-	log.Println("Server is started listening on port:", srv.port)
-
-	signal.Notify(srv.stopChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-srv.stopChan
-
-		log.Println("Shutdown signal received. Stopping server...")
-
-		srv.cancel()  // Cancel the context (stops `run()` loop)
-		srv.Cleanup() // Cleanup all clients and close the listener
-	}()
-
-	// Accept incoming client connections
 	for {
-		select {
-		case <-srv.ctx.Done(): // Stop accepting new connections
-			log.Println("Server shutting down gracefully.")
-			return
-		default:
-			conn, err := srv.listener.Accept()
-			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					log.Println("Server listener closed. Stopping...")
-					return
-				}
-				log.Println("Failed to accept connection:", err)
-				continue
-			}
-			go srv.handleConnection(conn)
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Println("Accept error:", err)
+			continue
 		}
+
+		go srv.handleConnection(conn)
 	}
+
 }
 
-func (srv *Server) handleConnection(conn net.Conn) {
-	defer conn.Close()
+// handleConnection manages a new client connection.
+func (s *Server) handleConnection(conn net.Conn) {
+	reader := bufio.NewReader(conn)
 
-	client := NewClient(conn)
-
-	if err := client.setup(); err != nil {
-		log.Println(err)
+	// Get valid username and room name
+	username, roomName, err := s.setupClient(conn, reader)
+	if err != nil {
+		log.Printf("🚨 Failed to setup client: %v\n", err)
 		return
 	}
 
-	srv.addClient(client)
+	// -------------------------------------------
+	room := s.getOrCreateRoom(roomName)
 
-	srv.handleClientMessages(client)
+	client := NewClient(conn, username, room)
+
+	room.join <- client
+
+	go client.read()
+	go client.write()
 }
 
-// handleClientMessages reads messages from the client and processes them.
-func (srv *Server) handleClientMessages(client *Client) {
-	buffer := make([]byte, 1024)
+// getOrCreateRoom finds an existing room or creates a new one.
+func (s *Server) getOrCreateRoom(name string) *Room {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	for {
-		n, err := client.conn.Read(buffer)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				log.Printf("Client %s disconnected", client.username)
-			} else {
-				log.Printf("Client %s read error: %v", client.username, err)
-			}
-			srv.removeClient(client)
-			return
-		}
-
-		// Extract the actual message content
-		rawMessage := strings.TrimSpace(string(buffer[:n]))
-		if rawMessage == "" {
-			client.sendPrompt()
-			continue
-		}
-
-		message := NewMessage(rawMessage, client.username)
-
-		// Broadcast the message to other clients
-		srv.broadcastMessage(message, client)
-	}
-}
-
-func (srv *Server) addClient(client *Client) {
-	srv.mu.Lock()
-	srv.clients[client] = struct{}{}
-	srv.mu.Unlock()
-
-	log.Printf("Client %s connected from IP: %s", client.username, client.conn.RemoteAddr().String())
-}
-
-func (srv *Server) removeClient(client *Client) {
-	client.close()
-
-	srv.mu.Lock()
-	delete(srv.clients, client)
-	srv.mu.Unlock()
-
-	log.Printf("Client %s removed", client.username)
-}
-
-func (srv *Server) broadcastMessage(message Message, sender *Client) {
-	srv.mu.RLock()
-	defer srv.mu.RUnlock()
-
-	for client := range srv.clients {
-		if client == sender {
-			client.sendPrompt()
-			continue
-		}
-
-		if err := client.sendMessage(message); err != nil {
-			log.Printf("Error broadcasting to %s: %v", client.username, err)
-			srv.removeClient(client)
-		}
-		client.sendPrompt()
-	}
-}
-
-// Cleanup closes all connections and clears the clients map.
-func (srv *Server) Cleanup() {
-	log.Println("Cleaning up server...")
-
-	// Unlock before closing client connections
-	srv.mu.Lock()
-	clients := srv.clients
-	srv.clients = make(map[*Client]struct{}) // Reset clients map
-	srv.mu.Unlock()
-
-	for client := range clients {
-		log.Printf("Closing connection for client %s", client.username)
-		if closeErr := client.close(); closeErr != nil {
-			log.Printf("Error closing connection for %s: %v", client.username, closeErr)
-		}
+	if room, exist := s.rooms[name]; exist {
+		return room
 	}
 
-	// Close the listener safely
+	// Create a new room if no available space
+	newRoom := NewRoom(name)
+
+	s.rooms[name] = newRoom
+	log.Printf("🏠 Room %s created.\n", name)
+	go newRoom.run()
+	return newRoom
+}
+
+// Shutdown gracefully shuts down the server.
+func (srv *Server) Shutdown() {
+	log.Println("⚠️  Shutting down server...")
 	if srv.listener != nil {
 		srv.listener.Close()
 	}
 
-	log.Println("Server shutdown complete.")
+	// Close all rooms
+	srv.mu.Lock()
+	for name, room := range srv.rooms {
+		room.stop()
+		delete(srv.rooms, name)
+	}
+	srv.mu.Unlock()
+
+	log.Println("✅ Server shut down gracefully.")
+}
+
+// setupClient prompts the user until a valid username and room name are entered.
+func (s *Server) setupClient(conn net.Conn, reader *bufio.Reader) (string, string, error) {
+	// send Welcome Message
+	if err := sendWelcomeMessage(conn); err != nil {
+		log.Printf("🚨 Failed to send welcome message: %v\n", err)
+		return "", "", err
+	}
+
+	var username, roomName string
+
+	// Keep asking for username until it's valid
+	for {
+		conn.Write([]byte("Enter username: "))
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			return "", "", fmt.Errorf("error reading username: %w", err)
+		}
+		username = strings.TrimSpace(input)
+
+		if isValidUsername(username) {
+			break
+		}
+		conn.Write([]byte("❌ Invalid username. Must be 3-15 characters (A-Z, a-z, 0-9, _).\n"))
+	}
+
+	// Keep asking for room name until it's valid
+	for {
+		conn.Write([]byte("Enter room name: "))
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			return "", "", fmt.Errorf("error reading room name: %w", err)
+		}
+		roomName = strings.TrimSpace(input)
+
+		if isValidRoomName(roomName) {
+			break
+		}
+		conn.Write([]byte("❌ Invalid room name. Must be 3-20 characters (A-Z, a-z, 0-9, _).\n"))
+	}
+
+	return username, roomName, nil
+}
+
+func sendWelcomeMessage(conn net.Conn) error {
+	logo := `
+	▒█▀▀█ ▒█▀▀▀█ ▒█▀▀▀█ ▒█▀▄▀█ 　 ▒█▀▀█ ░█▀▀█ ▒█▀▀▀█ ▀▀█▀▀ 
+	▒█▄▄▀ ▒█░░▒█ ▒█░░▒█ ▒█▒█▒█ 　 ▒█░░░ ▒█▄▄█ ░▀▀▀▄▄ ░▒█░░ 
+	▒█░▒█ ▒█▄▄▄█ ▒█▄▄▄█ ▒█░░▒█ 　 ▒█▄▄█ ▒█░▒█ ▒█▄▄▄█ ░▒█░░ 
+ `
+	_, err := conn.Write([]byte(logo))
+	if err != nil {
+		return err
+	}
+
+	welcomeLines := []string{
+		"🚀 Get ready for an awesome chat experience! 🚀\n",
+		"💡 Broadcasting Live: Join the fun! 🎤 💡\n",
+		"👉 To get started, please enter your username. 👈\n",
+	}
+
+	for _, line := range welcomeLines {
+		_, err = conn.Write([]byte(line))
+		if err != nil {
+			return err
+		}
+		time.Sleep(200 * time.Millisecond) // Adds a cool typing effect
+	}
+
+	return err
 }

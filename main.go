@@ -10,5 +10,5 @@ func main() {
 
 	// Create and start server
 	server := NewServer(*port)
-	server.run()
+	server.Start()
 }
