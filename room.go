@@ -133,6 +133,11 @@ func (r *Room) removeClient(client *Client) {
 		delete(r.clients, client)
 		close(client.send)
 
+		if client.conn != nil {
+			client.conn.Close()
+			client.conn = nil
+		}
+
 		log.Printf("✅ %s left %s", client.username, r.name)
 	}
 }

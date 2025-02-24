@@ -2,6 +2,7 @@ package main
 
 import (
 	"math/rand"
+	"time"
 )
 
 const (
@@ -11,6 +12,13 @@ const (
 	ColorWhiteBackground = "\033[47m"
 )
 
+var random *rand.Rand
+
+func init() {
+	// Seed the random number generator once at startup
+	random = rand.New(rand.NewSource(time.Now().UnixNano()))
+}
+
 func getRandomColor() string {
 	colors := []string{
 		"\033[0;104m",
@@ -18,9 +26,9 @@ func getRandomColor() string {
 		"\033[0;106m",
 		"\033[1;100m",
 		"\033[1;103m",
-		"\033[1;41m]",
-		"\033[1;42m]",
+		"\033[1;41m",
+		"\033[1;42m",
 	}
 
-	return colors[rand.Intn(len(colors))]
+	return colors[random.Intn(len(colors))]
 }

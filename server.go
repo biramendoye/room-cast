@@ -44,7 +44,7 @@ func (srv *Server) Start() error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Println("Accept error:", err)
+			// log.Println("Accept error:", err)
 			continue
 		}
 
@@ -151,7 +151,7 @@ func (s *Server) setupClient(conn net.Conn, reader *bufio.Reader) (string, strin
 		conn.Write([]byte("❌ Invalid room name. Must be 3-20 characters (A-Z, a-z, 0-9, _).\n"))
 	}
 
-	return username, roomName, nil
+	return strings.ToLower(username), strings.ToUpper(roomName), nil
 }
 
 func sendWelcomeMessage(conn net.Conn) error {

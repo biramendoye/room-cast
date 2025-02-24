@@ -97,7 +97,6 @@ func (c *Client) write() {
 			log.Printf("🚨Error writing prompt: %v", err)
 		}
 	}
-	c.close()
 }
 
 // writeMessage writes the message to the TCP connection of the client
@@ -107,12 +106,6 @@ func (c *Client) writeMessage(msg []byte) error {
 }
 
 func (c *Client) close() {
-	// Ensure cleanup only happens once
-	if c.conn != nil {
-		c.conn.Close()
-		c.conn = nil
-	}
-
 	// Notify the room that this client is leaving
 	if c.room != nil {
 		c.room.leave <- c
