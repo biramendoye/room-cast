@@ -28,7 +28,7 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	<-sigChan // Wait for Ctrl+C
-	log.Println("\n🛑 Received shutdown signal!")
+	log.Println("🛑 Received shutdown signal!")
 
 	server.Shutdown() // Clean up rooms and close connections
 

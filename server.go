@@ -64,12 +64,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// -------------------------------------------
 	room := s.getOrCreateRoom(roomName)
 
 	client := NewClient(conn, username, room)
 
 	room.join <- client
+
+	room.sendHistory(client)
 
 	go client.read()
 	go client.write()
@@ -95,7 +96,7 @@ func (s *Server) getOrCreateRoom(name string) *Room {
 
 // Shutdown gracefully shuts down the server.
 func (srv *Server) Shutdown() {
-	log.Println("⚠️  Shutting down server...")
+	log.Println("⚠️ Shutting down server...")
 	if srv.listener != nil {
 		srv.listener.Close()
 	}
@@ -108,7 +109,7 @@ func (srv *Server) Shutdown() {
 	}
 	srv.mu.Unlock()
 
-	log.Println("✅ Server shut down gracefully.")
+	// log.Println("✅ Server shut down gracefully.")
 }
 
 // setupClient prompts the user until a valid username and room name are entered.

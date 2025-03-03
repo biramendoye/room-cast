@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"os"
+	"sync"
 )
 
 const maxClients = 10
+const maxHistory = 100
 
 // Room represents a chat room where clients can communicate.
 // The room name is displayed in a unique color in the terminal for visual distinction.
@@ -34,6 +40,10 @@ type Room struct {
 	// in the terminal. Each room has a unique color for better
 	// visual organization.
 	color string
+
+	historyFile string
+
+	mu sync.Mutex
 }
 
 // NewRoom creates a new chat room instance with the given name.
@@ -41,13 +51,14 @@ type Room struct {
 // Returns a pointer to the newly created Room instance.
 func NewRoom(name string) *Room {
 	room := &Room{
-		name:    name,
-		forward: make(chan []byte),
-		join:    make(chan *Client),
-		leave:   make(chan *Client),
-		clients: make(map[*Client]struct{}),
-		quit:    make(chan struct{}),
-		color:   getRandomColor(),
+		name:        name,
+		forward:     make(chan []byte),
+		join:        make(chan *Client),
+		leave:       make(chan *Client),
+		clients:     make(map[*Client]struct{}),
+		quit:        make(chan struct{}),
+		color:       getRandomColor(),
+		historyFile: fmt.Sprintf("history_%s", name),
 	}
 
 	return room
@@ -76,7 +87,8 @@ func (r *Room) run() {
 			}
 			r.clients[client] = struct{}{}
 			log.Printf("✅ %s joined %s", client.username, r.name)
-			client.send <- []byte(client.prompt)
+			// client.send <- []byte(client.prompt)
+			client.writeMessage([]byte(client.prompt))
 
 			// Notify others
 			r.broadcast(&Message{
@@ -97,10 +109,18 @@ func (r *Room) run() {
 			})
 
 		// forward message to all clients
-		case msg := <-r.forward:
+		case msgBytes := <-r.forward:
+			var msg Message
+			err := json.Unmarshal(msgBytes, &msg)
+			if err != nil {
+				log.Printf("❌ Failed to parse message JSON: %v", err)
+				continue
+			}
+			r.saveMessageToFile(msg)
+
 			for client := range r.clients {
 				select {
-				case client.send <- msg: // send the message
+				case client.send <- msgBytes: // send the message
 				default:
 					// failed to send
 					log.Printf("❌ Failed to send message to %s in room %s", client.username, r.name)
@@ -149,4 +169,45 @@ func (r *Room) broadcast(msg *Message) {
 			client.send <- jsonMessage
 		}
 	}
+}
+
+func (r *Room) saveMessageToFile(msg Message) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	file, err := os.OpenFile(r.historyFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("❌ Error saving message for %s: %v", r.name, err)
+		return
+	}
+	defer file.Close()
+
+	_, err = file.Write(bytes.TrimPrefix(msg.formatAndConvertToBytes(), []byte("\n")))
+	if err != nil {
+		log.Printf("❌ Error writing message to file: %v", err)
+	}
+}
+
+// sendHistory reads the entire history file and sends it to the client
+func (r *Room) sendHistory(client *Client) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	file, err := os.Open(r.historyFile)
+	if err != nil {
+		client.writeMessage([]byte("📭 No chat history available.\n"))
+		return
+	}
+	defer file.Close()
+
+	// Read entire file content
+	historyBytes, err := io.ReadAll(file)
+	if err != nil {
+		log.Printf("❌ Error reading history file: %v", err)
+		client.writeMessage([]byte("❌ Failed to load chat history.\n"))
+		return
+	}
+
+	client.writeMessage([]byte("📜 Previous messages:\n"))
+	client.writeMessage(historyBytes)
 }
